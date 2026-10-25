@@ -649,6 +649,7 @@
 
       if (stroke.type === "image") {
         drawImageStroke(targetCtx, stroke);
+        return;
       }
       if (stroke.type === "region") {
         drawRegion(targetCtx, stroke);
@@ -677,6 +678,7 @@
 
       const topLeft = worldToScreen(stroke.x, stroke.y);
       targetCtx.drawImage(image, topLeft.x, topLeft.y, stroke.imageWidth * viewport.zoom, stroke.imageHeight * viewport.zoom);
+      } 
     function drawRegion(targetCtx, region) {
       if (!region.loops || region.loops.length === 0) return;
 
