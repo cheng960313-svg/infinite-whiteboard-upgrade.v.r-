@@ -362,6 +362,7 @@
     <input type="file" id="importJsonInput" accept="application/json" hidden>
   </main>
 
+  <script src="vendor/clipper.js"></script>
   <script>
     const canvas = document.getElementById("board");
     const ctx = canvas.getContext("2d");
@@ -446,6 +447,8 @@
     let layerCanvas = document.createElement("canvas");
     let layerCtx = layerCanvas.getContext("2d");
     const imageCache = new Map();
+    let strokeCanvas = document.createElement("canvas");
+    let strokeCtx = strokeCanvas.getContext("2d");
 
     function cssWidth() {
       return canvas.clientWidth || window.innerWidth;
@@ -589,14 +592,46 @@
         layerCtx.clearRect(0, 0, layerCanvas.width, layerCanvas.height);
         layerCtx.restore();
 
+        if (strokeCanvas.width !== layerCanvas.width || strokeCanvas.height !== layerCanvas.height) {
+          strokeCanvas.width = layerCanvas.width;
+          strokeCanvas.height = layerCanvas.height;
+        }
+
         for (const stroke of strokes) {
-          drawStroke(layerCtx, stroke);
+          if (stroke.type === "eraser") continue;
+          drawStrokeWithErasures(layerCtx, stroke);
         }
 
         layerDirty = false;
       }
 
       ctx.drawImage(layerCanvas, 0, 0, cssWidth(), cssHeight());
+    }
+
+    function drawStrokeWithErasures(targetCtx, stroke) {
+      if (!stroke || stroke.type === "eraser") {
+        drawStroke(targetCtx, stroke);
+        return;
+      }
+
+      const dpr = window.devicePixelRatio || 1;
+      strokeCtx.save();
+      strokeCtx.setTransform(1, 0, 0, 1, 0, 0);
+      strokeCtx.clearRect(0, 0, strokeCanvas.width, strokeCanvas.height);
+      strokeCtx.restore();
+      strokeCtx.save();
+      strokeCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawStroke(strokeCtx, stroke);
+      for (const erasure of stroke.erasures || []) {
+        drawFreehand(strokeCtx, {
+          type: "eraser",
+          points: erasure.points,
+          width: erasure.width
+        });
+      }
+      strokeCtx.restore();
+
+      targetCtx.drawImage(strokeCanvas, 0, 0, cssWidth(), cssHeight());
     }
 
     function drawStroke(targetCtx, stroke) {
@@ -614,6 +649,8 @@
 
       if (stroke.type === "image") {
         drawImageStroke(targetCtx, stroke);
+      if (stroke.type === "region") {
+        drawRegion(targetCtx, stroke);
         return;
       }
 
@@ -639,6 +676,25 @@
 
       const topLeft = worldToScreen(stroke.x, stroke.y);
       targetCtx.drawImage(image, topLeft.x, topLeft.y, stroke.imageWidth * viewport.zoom, stroke.imageHeight * viewport.zoom);
+    function drawRegion(targetCtx, region) {
+      if (!region.loops || region.loops.length === 0) return;
+
+      targetCtx.save();
+      targetCtx.globalCompositeOperation = "source-over";
+      targetCtx.fillStyle = region.color || "#000000";
+      targetCtx.beginPath();
+      for (const loop of region.loops) {
+        if (!loop || loop.length < 3) continue;
+        const first = worldToScreen(loop[0].x, loop[0].y);
+        targetCtx.moveTo(first.x, first.y);
+        for (let i = 1; i < loop.length; i += 1) {
+          const point = worldToScreen(loop[i].x, loop[i].y);
+          targetCtx.lineTo(point.x, point.y);
+        }
+        targetCtx.closePath();
+      }
+      targetCtx.fill("evenodd");
+      targetCtx.restore();
     }
 
     function drawFreehand(targetCtx, stroke) {
@@ -677,6 +733,116 @@
 
       targetCtx.stroke();
       targetCtx.restore();
+    }
+
+    function buildStrokeOutline(points, width) {
+      const source = (points || []).filter(isValidPoint);
+      const radius = Math.max(0.5, (width || 1) / 2);
+      if (source.length === 0) return [];
+
+      if (source.length === 1) {
+        return buildCircleOutline(source[0], radius, 24);
+      }
+
+      const left = [];
+      const right = [];
+      for (let i = 0; i < source.length; i += 1) {
+        const previous = source[Math.max(0, i - 1)];
+        const next = source[Math.min(source.length - 1, i + 1)];
+        const dx = next.x - previous.x;
+        const dy = next.y - previous.y;
+        const length = Math.hypot(dx, dy) || 1;
+        const nx = -dy / length;
+        const ny = dx / length;
+        left.push({ x: source[i].x + nx * radius, y: source[i].y + ny * radius });
+        right.push({ x: source[i].x - nx * radius, y: source[i].y - ny * radius });
+      }
+
+      const outline = left.slice();
+      const endTangent = normalizeVector(
+        source[source.length - 1].x - source[source.length - 2].x,
+        source[source.length - 1].y - source[source.length - 2].y
+      );
+      const endNormal = { x: -endTangent.y, y: endTangent.x };
+      appendCap(outline, source[source.length - 1], endNormal, true, radius, 12);
+      for (let i = right.length - 1; i >= 0; i -= 1) outline.push(right[i]);
+
+      const startTangent = normalizeVector(
+        source[1].x - source[0].x,
+        source[1].y - source[0].y
+      );
+      const startNormal = { x: -startTangent.y, y: startTangent.x };
+      appendCap(outline, source[0], { x: -startNormal.x, y: -startNormal.y }, true, radius, 12);
+      return removeDuplicatePoints(outline);
+    }
+
+    function buildCircleOutline(center, radius, steps) {
+      const points = [];
+      for (let i = 0; i < steps; i += 1) {
+        const angle = Math.PI * 2 * i / steps;
+        points.push({
+          x: center.x + Math.cos(angle) * radius,
+          y: center.y + Math.sin(angle) * radius
+        });
+      }
+      return points;
+    }
+
+    function appendCap(target, center, normal, reverse, radius, steps) {
+      const startAngle = Math.atan2(normal.y, normal.x);
+      const direction = reverse ? -1 : 1;
+      for (let i = 0; i <= steps; i += 1) {
+        const angle = startAngle + direction * Math.PI * i / steps;
+        target.push({
+          x: center.x + Math.cos(angle) * radius,
+          y: center.y + Math.sin(angle) * radius
+        });
+      }
+    }
+
+    function normalizeVector(x, y) {
+      const length = Math.hypot(x, y) || 1;
+      return { x: x / length, y: y / length };
+    }
+
+    function removeDuplicatePoints(points) {
+      const result = [];
+      for (const point of points) {
+        const previous = result[result.length - 1];
+        if (!previous || distance(previous, point) > 0.0001) result.push(point);
+      }
+      if (result.length > 1 && distance(result[0], result[result.length - 1]) < 0.0001) result.pop();
+      return result;
+    }
+
+    function polygonArea(loop) {
+      let area = 0;
+      for (let i = 0; i < loop.length; i += 1) {
+        const a = loop[i];
+        const b = loop[(i + 1) % loop.length];
+        area += a.x * b.y - b.x * a.y;
+      }
+      return area / 2;
+    }
+
+    function pointInPolygon(point, loop) {
+      let inside = false;
+      for (let i = 0, j = loop.length - 1; i < loop.length; j = i++) {
+        const a = loop[i];
+        const b = loop[j];
+        const crosses = ((a.y > point.y) !== (b.y > point.y))
+          && point.x < (b.x - a.x) * (point.y - a.y) / ((b.y - a.y) || 0.0000001) + a.x;
+        if (crosses) inside = !inside;
+      }
+      return inside;
+    }
+
+    function pointInLoops(point, loops) {
+      let inside = false;
+      for (const loop of loops) {
+        if (pointInPolygon(point, loop)) inside = !inside;
+      }
+      return inside;
     }
 
     function drawShape(targetCtx, stroke) {
@@ -970,12 +1136,52 @@
     }
 
     function setTool(tool) {
+      if (activeTool !== tool && (currentStroke || previewShape)) {
+        settleCurrentDrawing();
+      }
       activeTool = tool;
       for (const button of toolbar.querySelectorAll("[data-tool]")) {
         button.classList.toggle("active", button.dataset.tool === tool);
       }
       updatePanCursor();
       requestRedraw();
+    }
+
+    function settleCurrentDrawing() {
+      const pendingStroke = currentStroke;
+      const pendingShape = previewShape;
+      if (!pendingStroke && !pendingShape) return false;
+
+      let changed = false;
+      if (pendingStroke) {
+        if (pendingStroke.type === "eraser") {
+          let eraseFailed = false;
+          try {
+            changed = applyEraserToStrokes(pendingStroke);
+          } catch (error) {
+            console.error("橡皮擦差集處理失敗；原筆跡未修改", error);
+            eraseFailed = true;
+            changed = false;
+          }
+          if (eraseFailed) {
+            showStatus("複雜筆跡擦除失敗；原筆跡未修改。");
+          } else if (!changed) {
+            showStatus("橡皮擦沒有碰到可擦除的筆跡。");
+          }
+        } else {
+          commitStroke(pendingStroke);
+          changed = true;
+        }
+      } else if (pendingShape) {
+        commitStroke(pendingShape);
+        changed = true;
+      }
+
+      cancelDrawing();
+      markLayerDirty();
+      requestRedraw();
+      scheduleAutosave();
+      return changed;
     }
 
     function updatePanCursor() {
@@ -1043,7 +1249,8 @@
         const data = JSON.parse(savedText);
         if (!data || !Array.isArray(data.strokes)) return;
 
-        strokes = data.strokes.filter(isValidStroke).map(cloneStroke);
+        const savedStrokes = data.strokes.filter(isValidStroke).map(cloneStroke);
+        strokes = migrateLegacyErasers(savedStrokes);
         undoStack = [];
         redoStack = [];
         selectedStrokeId = null;
@@ -1394,6 +1601,24 @@
         }
       }
 
+      if (stroke.loops) {
+        for (const loop of stroke.loops) {
+          for (const point of loop) {
+            point.x += deltaX;
+            point.y += deltaY;
+          }
+        }
+      }
+
+      if (stroke.erasures) {
+        for (const erasure of stroke.erasures) {
+          for (const point of erasure.points || []) {
+            point.x += deltaX;
+            point.y += deltaY;
+          }
+        }
+      }
+
       if (stroke.start) {
         stroke.start.x += deltaX;
         stroke.start.y += deltaY;
@@ -1437,6 +1662,9 @@
       }
 
       const points = [];
+      if (stroke.type === "region" && stroke.loops) {
+        for (const loop of stroke.loops) points.push(...loop);
+      }
       if (stroke.points) points.push(...stroke.points);
       if (stroke.start) points.push(stroke.start);
       if (stroke.end) points.push(stroke.end);
@@ -1524,7 +1752,7 @@
       } else if (action.type === "move" || action.type === "update") {
         replaceStrokeById(action.strokeId, cloneStroke(action.before));
         selectedStrokeId = action.strokeId;
-      } else if (action.type === "clear") {
+      } else if (action.type === "clear" || action.type === "erase") {
         strokes = action.strokes.map(cloneStroke);
         selectedStrokeId = null;
       }
@@ -1622,12 +1850,324 @@
       return true;
     }
 
+    function applyEraserToStrokes(eraserStroke) {
+      if (!eraserStroke || !eraserStroke.points || eraserStroke.points.length === 0) return false;
+
+      const before = strokes.map(cloneStroke);
+      const erasure = {
+        id: newId("erase"),
+        width: eraserStroke.width || 1,
+        points: eraserStroke.points.map((point) => ({ x: point.x, y: point.y }))
+      };
+      const nextStrokes = [];
+      let changed = false;
+
+      for (const stroke of strokes) {
+        if (stroke.type === "eraser") {
+          // 舊版可能把橡皮擦路徑當成獨立物件保存；新版不再把它繪製到圖層。
+          changed = true;
+          continue;
+        }
+
+        if (stroke.type === "freehand" || stroke.type === "region") {
+          const fragments = subtractEraserFromStroke(stroke, erasure);
+          if (fragments === null) {
+            showStatus("複雜筆跡擦除失敗；原筆跡未修改。");
+            return false;
+          }
+          const changedByDifference = fragments.length !== 1 || fragments[0] !== stroke;
+          const validFragments = fragments.length === 0 || fragments.every(isValidStroke);
+          if (changedByDifference && validFragments) {
+            changed = true;
+            nextStrokes.push(...fragments);
+          } else {
+            nextStrokes.push(stroke);
+          }
+        } else if (eraserTouchesVisibleStroke(erasure, stroke)) {
+          if (!Array.isArray(stroke.erasures)) stroke.erasures = [];
+          stroke.erasures.push(cloneStroke(erasure));
+          nextStrokes.push(stroke);
+          changed = true;
+        } else {
+          nextStrokes.push(stroke);
+        }
+      }
+
+      if (!changed) return false;
+      strokes = nextStrokes;
+      pushUndoAction({
+        type: "erase",
+        strokes: before
+      });
+      markLayerDirty();
+      requestRedraw();
+      scheduleAutosave();
+      showStatus("已擦除筆跡；可返回上一步復原。");
+      return true;
+    }
+
+    function subtractEraserFromStroke(stroke, erasure) {
+      if (!window.ClipperLib) return null;
+      return subtractStrokeWithClipper(stroke, erasure);
+    }
+
+    const CLIPPER_SCALE = 1000;
+
+    function subtractStrokeWithClipper(stroke, erasure) {
+      const subjectPaths = stroke.type === "freehand"
+        ? clipperInflateOpenPath(stroke.points, stroke.width)
+        : clipperUnionPaths((stroke.loops || []).map(clipperPathFromLoop), ClipperLib.PolyFillType.pftEvenOdd);
+      if (!subjectPaths || subjectPaths.length === 0) return null;
+
+      const currentPaths = clipperUnionPaths(subjectPaths, ClipperLib.PolyFillType.pftNonZero);
+      if (!currentPaths || currentPaths.length === 0) return null;
+      const previousErasures = (stroke.erasures || []).flatMap((item) => (
+        clipperInflateOpenPath(item.points, item.width)
+      ));
+      const eraserPaths = [
+        ...previousErasures,
+        ...clipperInflateOpenPath(erasure.points, erasure.width)
+      ];
+      const clipPaths = clipperUnionPaths(eraserPaths, ClipperLib.PolyFillType.pftNonZero);
+      if (!clipPaths) return null;
+      if (clipPaths.length === 0) return [stroke];
+
+      const remainingPaths = clipperDifferencePaths(currentPaths, clipPaths);
+      if (!remainingPaths) return null;
+      const beforeArea = clipperPathsArea(currentPaths);
+      const afterArea = clipperPathsArea(remainingPaths);
+      if (!Number.isFinite(beforeArea) || !Number.isFinite(afterArea)) return null;
+      if (remainingPaths.length === 0) return [];
+      if (afterArea >= beforeArea - Math.max(0.01, beforeArea * 0.000001)) return [stroke];
+
+      const loops = remainingPaths.map(clipperLoopToWorld).filter((loop) => (
+        loop.length >= 3 && Number.isFinite(Math.abs(polygonArea(loop)))
+      ));
+      if (loops.length === 0) return null;
+
+      const fragments = groupClipperLoops(loops).map((group) => ({
+        id: newId("fragment"),
+        type: "region",
+        color: stroke.color || "#000000",
+        width: stroke.width || 1,
+        loops: group,
+        sourceStrokeId: stroke.sourceStrokeId || stroke.id,
+        fragmentGroupId: newId("fragmentGroup")
+      }));
+      return fragments.length > 0 && fragments.every(isValidStroke) ? fragments : null;
+    }
+
+    function clipperPathFromLoop(loop) {
+      return (loop || []).filter(isValidPoint).map((point) => ({
+        X: Math.round(point.x * CLIPPER_SCALE),
+        Y: Math.round(point.y * CLIPPER_SCALE)
+      }));
+    }
+
+    function clipperInflateOpenPath(points, width) {
+      const source = simplifyClipperCenterline(points, width);
+      if (source.length === 0) return [];
+      if (source.length === 1) {
+        return [clipperPathFromLoop(buildCircleOutline(source[0], Math.max(0.5, width || 1) / 2, 32))];
+      }
+
+      const offset = new ClipperLib.ClipperOffset(2, 0.25 * CLIPPER_SCALE);
+      offset.AddPath(
+        source.map((point) => ({
+          X: Math.round(point.x * CLIPPER_SCALE),
+          Y: Math.round(point.y * CLIPPER_SCALE)
+        })),
+        ClipperLib.JoinType.jtRound,
+        ClipperLib.EndType.etOpenRound
+      );
+      const result = new ClipperLib.Paths();
+      offset.Execute(result, Math.max(0.5, width || 1) * CLIPPER_SCALE / 2);
+      return result;
+    }
+
+    function simplifyClipperCenterline(points, width) {
+      const source = (points || []).filter(isValidPoint);
+      if (source.length <= 2500) return source;
+
+      const spacing = Math.max(0.25, (width || 1) * 0.2);
+      const reduced = [source[0]];
+      for (let i = 1; i < source.length - 1; i += 1) {
+        if (distance(reduced[reduced.length - 1], source[i]) >= spacing) {
+          reduced.push(source[i]);
+        }
+      }
+      reduced.push(source[source.length - 1]);
+      if (reduced.length <= 2500) return reduced;
+
+      const step = Math.ceil(reduced.length / 2500);
+      const sampled = reduced.filter((_, index) => index % step === 0);
+      if (sampled[sampled.length - 1] !== reduced[reduced.length - 1]) {
+        sampled.push(reduced[reduced.length - 1]);
+      }
+      return sampled;
+    }
+
+    function clipperUnionPaths(paths, fillType) {
+      const valid = (paths || []).filter((path) => path && path.length >= 3);
+      if (valid.length === 0) return [];
+      const clipper = new ClipperLib.Clipper();
+      clipper.AddPaths(valid, ClipperLib.PolyType.ptSubject, true);
+      const result = new ClipperLib.Paths();
+      const succeeded = clipper.Execute(
+        ClipperLib.ClipType.ctUnion,
+        result,
+        fillType,
+        fillType
+      );
+      return succeeded ? result : null;
+    }
+
+    function clipperDifferencePaths(subject, clip) {
+      if (!subject || subject.length === 0 || !clip || clip.length === 0) return subject || [];
+      const clipper = new ClipperLib.Clipper();
+      clipper.AddPaths(subject, ClipperLib.PolyType.ptSubject, true);
+      clipper.AddPaths(clip, ClipperLib.PolyType.ptClip, true);
+      const result = new ClipperLib.Paths();
+      const succeeded = clipper.Execute(
+        ClipperLib.ClipType.ctDifference,
+        result,
+        ClipperLib.PolyFillType.pftNonZero,
+        ClipperLib.PolyFillType.pftNonZero
+      );
+      return succeeded ? result : null;
+    }
+
+    function clipperPathsArea(paths) {
+      return Math.abs((paths || []).reduce((sum, path) => {
+        let area = 0;
+        for (let i = 0; i < path.length; i += 1) {
+          const a = path[i];
+          const b = path[(i + 1) % path.length];
+          area += a.X * b.Y - b.X * a.Y;
+        }
+        return sum + area / 2;
+      }, 0)) / (CLIPPER_SCALE * CLIPPER_SCALE);
+    }
+
+    function clipperLoopToWorld(path) {
+      return removeDuplicatePoints(path.map((point) => ({
+        x: point.X / CLIPPER_SCALE,
+        y: point.Y / CLIPPER_SCALE
+      })));
+    }
+
+    function groupClipperLoops(loops) {
+      const ordered = loops
+        .filter((loop) => loop.length >= 3)
+        .sort((a, b) => Math.abs(polygonArea(b)) - Math.abs(polygonArea(a)));
+      const records = ordered.map((loop) => ({ loop, containers: [] }));
+      for (const record of records) {
+        for (const other of records) {
+          if (record === other || Math.abs(polygonArea(other.loop)) <= Math.abs(polygonArea(record.loop))) continue;
+          if (pointInPolygon(record.loop[0], other.loop)) record.containers.push(other);
+        }
+      }
+
+      const groups = [];
+      const outerRecords = records.filter((record) => record.containers.length % 2 === 0);
+      for (const outer of outerRecords) groups.push([outer.loop]);
+      for (const hole of records.filter((record) => record.containers.length % 2 === 1)) {
+        const parent = outerRecords
+          .filter((outer) => pointInPolygon(hole.loop[0], outer.loop))
+          .sort((a, b) => Math.abs(polygonArea(a.loop)) - Math.abs(polygonArea(b.loop)))[0];
+        if (parent) groups[outerRecords.indexOf(parent)].push(hole.loop);
+      }
+      return groups;
+    }
+
+
+    function eraserTouchesVisibleStroke(erasure, stroke) {
+      const points = erasure.points || [];
+      const tolerance = Math.max(
+        0.5 / viewport.zoom,
+        ((erasure.width || 1) + (stroke.width || 1)) / 2
+      );
+      const samplePoint = (point) => {
+        return isEraserPointNearStroke(stroke, point, tolerance)
+          && !isPointCoveredByStrokeErasures(stroke, point);
+      };
+
+      for (let i = 0; i < points.length; i += 1) {
+        if (samplePoint(points[i])) return true;
+        if (i === 0) continue;
+
+        const start = points[i - 1];
+        const end = points[i];
+        const length = distance(start, end);
+        const steps = Math.max(1, Math.ceil(length / Math.max(0.5, 1 / viewport.zoom)));
+        for (let step = 1; step < steps; step += 1) {
+          const ratio = step / steps;
+          if (samplePoint({
+            x: start.x + (end.x - start.x) * ratio,
+            y: start.y + (end.y - start.y) * ratio
+          })) return true;
+        }
+      }
+      return false;
+    }
+
+    function isEraserPointNearStroke(stroke, point, tolerance) {
+      if (stroke.type === "sticky" && isValidStickyNote(stroke)) {
+        return point.x >= stroke.x - tolerance
+          && point.x <= stroke.x + stroke.noteWidth + tolerance
+          && point.y >= stroke.y - tolerance
+          && point.y <= stroke.y + stroke.noteHeight + tolerance;
+      }
+      return isStrokeHit(stroke, point, tolerance);
+    }
+
+    function isPointCoveredByStrokeErasures(stroke, world) {
+      for (const erasure of stroke.erasures || []) {
+        const erasureTolerance = Math.max(
+          0.5 / viewport.zoom,
+          ((erasure.width || 1) + (stroke.width || 1)) / 2
+        );
+        if (isPointNearPolyline(world, erasure.points || [], erasureTolerance)) return true;
+      }
+      return false;
+    }
+
+    function migrateLegacyErasers(savedStrokes) {
+      const migrated = [];
+
+      for (const stroke of savedStrokes) {
+        if (stroke.type !== "eraser") {
+          migrated.push(stroke);
+          continue;
+        }
+
+        const erasure = {
+          id: stroke.id || newId("erase"),
+          width: stroke.width || 1,
+          points: (stroke.points || []).map((point) => ({ x: point.x, y: point.y }))
+        };
+
+        for (const existing of migrated) {
+          if (existing.type === "eraser") continue;
+          if (!eraserTouchesVisibleStroke(erasure, existing)) continue;
+          if (!Array.isArray(existing.erasures)) existing.erasures = [];
+          existing.erasures.push(cloneStroke(erasure));
+        }
+      }
+
+      return migrated;
+    }
+
     function findStrokeAt(world) {
       for (let i = strokes.length - 1; i >= 0; i -= 1) {
         const stroke = strokes[i];
         if (stroke.type === "eraser") continue;
 
-        if (isStrokeHit(stroke, world)) {
+        if (
+          isStrokeHit(stroke, world)
+          && !isPointCoveredByStrokeErasures(stroke, world)
+          && !isStrokeCoveredByLaterEraser(i, world)
+        ) {
           return {
             stroke,
             index: i
@@ -1637,8 +2177,40 @@
       return null;
     }
 
-    function isStrokeHit(stroke, world) {
-      const tolerance = Math.max(STROKE_ERASER_TOLERANCE / viewport.zoom, (stroke.width || 1) / 2 + 3 / viewport.zoom);
+    function isStrokeCoveredByLaterEraser(strokeIndex, world) {
+      const stroke = strokes[strokeIndex];
+      if (!stroke) return false;
+
+      for (let i = strokeIndex + 1; i < strokes.length; i += 1) {
+        const eraser = strokes[i];
+        if (eraser.type !== "eraser") continue;
+
+        const tolerance = Math.max(
+          0.5 / viewport.zoom,
+          ((eraser.width || 1) + (stroke.width || 1)) / 2
+        );
+        if (isPointNearPolyline(world, eraser.points || [], tolerance)) return true;
+      }
+      return false;
+    }
+
+    function isStrokeHit(stroke, world, customTolerance) {
+      const tolerance = customTolerance === undefined
+        ? Math.max(STROKE_ERASER_TOLERANCE / viewport.zoom, (stroke.width || 1) / 2 + 3 / viewport.zoom)
+        : customTolerance;
+
+      if (stroke.type === "region") {
+        if (pointInLoops(world, stroke.loops || [])) return true;
+        // Region fragments must keep the erased gap selectable as empty space.
+        // Use a small boundary tolerance instead of the generous stroke hit
+        // tolerance, which could bridge a narrow cut and select the fragment
+        // on the other side.
+        const boundaryTolerance = Math.max(
+          0.5 / viewport.zoom,
+          Math.min(tolerance, (stroke.width || 1) / 4)
+        );
+        return (stroke.loops || []).some((loop) => isPointNearPolyline(world, loop, boundaryTolerance));
+      }
 
       if (stroke.type === "freehand") {
         return isPointNearPolyline(world, stroke.points || [], tolerance);
@@ -1785,6 +2357,9 @@
       }
 
       if (activeTool === "pen" || activeTool === "eraser") {
+        if (activeTool === "eraser") {
+          showStatus("橡皮擦已啟用；放開後會保存擦除結果。");
+        }
         currentStroke = {
           id: newId("stroke"),
           type: activeTool === "pen" ? "freehand" : "eraser",
@@ -1864,17 +2439,7 @@
 
       if (drawingPointerId !== event.pointerId) return;
       continueDrawing(event);
-
-      if (currentStroke) {
-        commitStroke(currentStroke);
-      } else if (previewShape) {
-        commitStroke(previewShape);
-      }
-
-      cancelDrawing();
-      markLayerDirty();
-      requestRedraw();
-      scheduleAutosave();
+      settleCurrentDrawing();
     }
 
     function beginPan(event) {
@@ -1971,7 +2536,13 @@
     canvas.addEventListener("pointerdown", (event) => {
       if (event.target !== canvas) return;
       event.preventDefault();
-      canvas.setPointerCapture(event.pointerId);
+      try {
+        canvas.setPointerCapture(event.pointerId);
+      } catch (error) {
+        // Synthetic or already-cancelled pointers cannot be captured; the
+        // drawing can still use the normal pointer event path.
+        console.warn("Unable to capture pointer", error);
+      }
       updateActivePointer(event);
 
       if (activePointers.size === 2) {
@@ -2013,14 +2584,23 @@
     });
 
     function finishPointer(event) {
-      if (activePointers.has(event.pointerId)) {
-        activePointers.delete(event.pointerId);
-      }
+      const pointerId = event.pointerId;
+      const isCurrentDrawing = drawingPointerId === pointerId
+        || strokeErasePointerId === pointerId
+        || Boolean(currentStroke)
+        || Boolean(previewShape);
 
-      if (pinchState) {
-        cancelDrawing();
+      if (activePointers.has(pointerId)) activePointers.delete(pointerId);
+
+      // A drawing must be settled before considering an old pinch state. The
+      // previous order could cancel the eraser instead of committing it.
+      if (isCurrentDrawing) {
         pinchState = null;
-      } else if (stickyResizePointerId === event.pointerId) {
+        endDrawing(event);
+      } else if (pinchState) {
+        pinchState = null;
+        cancelDrawing();
+      } else if (stickyResizePointerId === pointerId) {
         endStickyResize(event);
       } else if (isPanning) {
         endPan(event);
@@ -2028,15 +2608,30 @@
         endDrawing(event);
       }
 
-      if (canvas.hasPointerCapture && canvas.hasPointerCapture(event.pointerId)) {
-        canvas.releasePointerCapture(event.pointerId);
+      if (canvas.hasPointerCapture && canvas.hasPointerCapture(pointerId)) {
+        canvas.releasePointerCapture(pointerId);
       }
     }
 
     canvas.addEventListener("pointerup", finishPointer);
     canvas.addEventListener("pointercancel", finishPointer);
-    canvas.addEventListener("pointerleave", (event) => {
-      if (event.pointerType === "mouse" && event.buttons !== 0) {
+    window.addEventListener("pointerup", (event) => {
+      if (event.target !== canvas && (
+        drawingPointerId === event.pointerId
+        || strokeErasePointerId === event.pointerId
+        || currentStroke
+        || previewShape
+      )) {
+        finishPointer(event);
+      }
+    });
+    window.addEventListener("pointercancel", (event) => {
+      if (event.target !== canvas && (
+        drawingPointerId === event.pointerId
+        || strokeErasePointerId === event.pointerId
+        || currentStroke
+        || previewShape
+      )) {
         finishPointer(event);
       }
     });
@@ -2291,7 +2886,7 @@
         return;
       }
 
-      strokes = data.strokes.filter(isValidStroke).map(cloneStroke);
+      strokes = migrateLegacyErasers(data.strokes.filter(isValidStroke).map(cloneStroke));
       undoStack = [];
       redoStack = [];
       selectedStrokeId = null;
@@ -2319,9 +2914,19 @@
 
     function isValidStroke(stroke) {
       if (!stroke || typeof stroke.type !== "string") return false;
+      if (stroke.erasures !== undefined && (
+        !Array.isArray(stroke.erasures)
+        || !stroke.erasures.every(isValidErasure)
+      )) return false;
 
       if (stroke.type === "freehand" || stroke.type === "eraser") {
         return Array.isArray(stroke.points) && stroke.points.every(isValidPoint);
+      }
+
+      if (stroke.type === "region") {
+        return Array.isArray(stroke.loops)
+          && stroke.loops.length > 0
+          && stroke.loops.every((loop) => Array.isArray(loop) && loop.length >= 3 && loop.every(isValidPoint));
       }
 
       if (SHAPE_TOOLS.has(stroke.type)) {
@@ -2367,6 +2972,12 @@
         image.onerror = reject;
         image.src = src;
       });
+    function isValidErasure(erasure) {
+      return erasure
+        && Number.isFinite(erasure.width)
+        && erasure.width > 0
+        && Array.isArray(erasure.points)
+        && erasure.points.every(isValidPoint);
     }
 
     function isValidStickyNote(note) {
