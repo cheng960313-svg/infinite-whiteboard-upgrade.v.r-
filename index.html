@@ -302,6 +302,9 @@
     <canvas id="board"></canvas>
 
     <div id="toolbar" role="toolbar" aria-label="白板工具列">
+      <div class="tool-group" aria-label="匯入內容">
+        <button id="importImageBtn" type="button" title="匯入圖片" aria-label="匯入圖片">＋圖片</button>
+      </div>
       <div class="tool-group" aria-label="繪圖工具">
         <button class="icon-button active" type="button" data-tool="pen" title="筆刷" aria-label="筆刷">✎</button>
         <button class="icon-button" type="button" data-tool="eraser" title="橡皮擦" aria-label="橡皮擦">⌫</button>
@@ -355,6 +358,7 @@
 
     <div id="status" role="status" aria-live="polite"></div>
     <textarea id="stickyEditor" aria-label="便條內容"></textarea>
+    <input type="file" id="importImageInput" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
     <input type="file" id="importJsonInput" accept="application/json" hidden>
   </main>
 
@@ -369,6 +373,8 @@
     const smoothToggleBtn = document.getElementById("smoothToggleBtn");
     const zoomLabel = document.getElementById("zoomLabel");
     const addStickyBtn = document.getElementById("addStickyBtn");
+    const importImageBtn = document.getElementById("importImageBtn");
+    const importImageInput = document.getElementById("importImageInput");
     const undoBtn = document.getElementById("undoBtn");
     const deleteSelectedBtn = document.getElementById("deleteSelectedBtn");
     const clearBtn = document.getElementById("clearBtn");
@@ -394,6 +400,8 @@
     const STICKY_RESIZE_HANDLE_SIZE = 16;
     const AUTOSAVE_KEY = "infinite-whiteboard.autosave.v1";
     const AUTOSAVE_DELAY = 250;
+    const MAX_IMAGE_FILE_SIZE = 1 * 1024 * 1024;
+    const MAX_IMAGE_SIDE = 600;
     const PINCH_ZOOM_DEADZONE = 0.015;
     const SHAPE_TOOLS = new Set(["line", "rect", "circle", "ellipse"]);
 
@@ -438,6 +446,7 @@
     let layerDirty = true;
     let layerCanvas = document.createElement("canvas");
     let layerCtx = layerCanvas.getContext("2d");
+    const imageCache = new Map();
     let strokeCanvas = document.createElement("canvas");
     let strokeCtx = strokeCanvas.getContext("2d");
 
@@ -638,6 +647,8 @@
         return;
       }
 
+      if (stroke.type === "image") {
+        drawImageStroke(targetCtx, stroke);
       if (stroke.type === "region") {
         drawRegion(targetCtx, stroke);
         return;
@@ -648,6 +659,23 @@
       }
     }
 
+    function drawImageStroke(targetCtx, stroke) {
+      if (!isValidImageStroke(stroke)) return;
+
+      let image = imageCache.get(stroke.src);
+      if (!image) {
+        image = new Image();
+        imageCache.set(stroke.src, image);
+        image.onload = () => {
+          markLayerDirty();
+          requestRedraw();
+        };
+        image.src = stroke.src;
+      }
+      if (!image.complete || image.naturalWidth === 0) return;
+
+      const topLeft = worldToScreen(stroke.x, stroke.y);
+      targetCtx.drawImage(image, topLeft.x, topLeft.y, stroke.imageWidth * viewport.zoom, stroke.imageHeight * viewport.zoom);
     function drawRegion(targetCtx, region) {
       if (!region.loops || region.loops.length === 0) return;
 
@@ -1605,6 +1633,11 @@
         stroke.x += deltaX;
         stroke.y += deltaY;
       }
+
+      if (stroke.type === "image") {
+        stroke.x += deltaX;
+        stroke.y += deltaY;
+      }
     }
 
     function getStrokeBounds(stroke) {
@@ -1616,6 +1649,15 @@
           minY: stroke.y,
           maxX: stroke.x + stroke.noteWidth,
           maxY: stroke.y + stroke.noteHeight
+        };
+      }
+
+      if (stroke.type === "image" && isValidImageStroke(stroke)) {
+        return {
+          minX: stroke.x,
+          minY: stroke.y,
+          maxX: stroke.x + stroke.imageWidth,
+          maxY: stroke.y + stroke.imageHeight
         };
       }
 
@@ -1678,6 +1720,8 @@
         delete stroke.start;
         delete stroke.end;
       }
+
+      if (stroke.type === "image" && !isValidImageStroke(stroke)) return;
 
       strokes.push(stroke);
       markLayerDirty();
@@ -2192,6 +2236,14 @@
         return isPointInStickyNote(world, stroke);
       }
 
+      if (stroke.type === "image") {
+        return isValidImageStroke(stroke)
+          && world.x >= stroke.x
+          && world.x <= stroke.x + stroke.imageWidth
+          && world.y >= stroke.y
+          && world.y <= stroke.y + stroke.imageHeight;
+      }
+
       return false;
     }
 
@@ -2639,6 +2691,51 @@
     });
 
     addStickyBtn.addEventListener("click", addStickyNote);
+    importImageBtn.addEventListener("click", () => {
+      importImageInput.value = "";
+      importImageInput.click();
+    });
+
+    importImageInput.addEventListener("change", async () => {
+      const file = importImageInput.files && importImageInput.files[0];
+      if (!file) return;
+      if (!/^image\/(png|jpeg|webp|gif)$/i.test(file.type)) {
+        showStatus("請選擇 PNG、JPEG、WebP 或 GIF 圖片。");
+        return;
+      }
+      if (file.size > MAX_IMAGE_FILE_SIZE) {
+        showStatus("圖片檔案需小於 1 MB。");
+        return;
+      }
+
+      try {
+        const src = await readImageFile(file);
+        const image = await loadImage(src);
+        const scale = Math.min(1, MAX_IMAGE_SIDE / image.naturalWidth, MAX_IMAGE_SIDE / image.naturalHeight);
+        const imageWidth = Math.max(1, Math.round(image.naturalWidth * scale));
+        const imageHeight = Math.max(1, Math.round(image.naturalHeight * scale));
+        const center = screenToWorld(cssWidth() / 2, cssHeight() / 2);
+        const stroke = {
+          id: newId("image"),
+          type: "image",
+          src,
+          x: center.x - imageWidth / 2,
+          y: center.y - imageHeight / 2,
+          imageWidth,
+          imageHeight
+        };
+        strokes.push(stroke);
+        selectedStrokeId = stroke.id;
+        setTool("select");
+        markLayerDirty();
+        pushUndoAction({ type: "add", stroke: cloneStroke(stroke) });
+        requestRedraw();
+        scheduleAutosave();
+        showStatus("圖片已加入白板，可用選擇工具移動。");
+      } catch (error) {
+        showStatus("圖片讀取失敗，請換一張圖片再試。");
+      }
+    });
     undoBtn.addEventListener("click", undoLastAction);
     deleteSelectedBtn.addEventListener("click", deleteSelectedStroke);
 
@@ -2840,9 +2937,41 @@
         return isValidStickyNote(stroke);
       }
 
+      if (stroke.type === "image") {
+        return isValidImageStroke(stroke);
+      }
+
       return false;
     }
 
+    function isValidImageStroke(stroke) {
+      return stroke
+        && typeof stroke.src === "string"
+        && /^data:image\/(png|jpeg|webp|gif);base64,/i.test(stroke.src)
+        && Number.isFinite(stroke.x)
+        && Number.isFinite(stroke.y)
+        && Number.isFinite(stroke.imageWidth)
+        && Number.isFinite(stroke.imageHeight)
+        && stroke.imageWidth > 0
+        && stroke.imageHeight > 0;
+    }
+
+    function readImageFile(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error || new Error("讀取圖片失敗"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function loadImage(src) {
+      return new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = reject;
+        image.src = src;
+      });
     function isValidErasure(erasure) {
       return erasure
         && Number.isFinite(erasure.width)
